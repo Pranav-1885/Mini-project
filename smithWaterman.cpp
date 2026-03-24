@@ -2,11 +2,9 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <iomanip>
 #include <fstream>
 #include <cstdlib>
 #include <cmath>
-#include <omp.h>   
 #include "triangular.h"
 
 using namespace std;
@@ -50,7 +48,6 @@ public:
             int start_i = max(1, d - n);
             int end_i   = min(m, d - 1);
 
-            #pragma omp parallel for
             for (int i = start_i; i <= end_i; i++) {
 
                 int j = d - i;
@@ -63,14 +60,10 @@ public:
 
                 dp[i][j] = max({0.0, matchMismatch, deleteGap, insertGap});
 
-                //  Thread-safe max update
-                #pragma omp critical
-                {
-                    if (dp[i][j] >= maxScore) {
-                        maxScore = dp[i][j];
-                        maxI = i;
-                        maxJ = j;
-                    }
+                if (dp[i][j] >= maxScore) {
+                    maxScore = dp[i][j];
+                    maxI = i;
+                    maxJ = j;
                 }
             }
         }
@@ -142,42 +135,98 @@ public:
 // File Writer Class
 // ─────────────────────────────────────────────
 class OutputManager {
-public:
-
-    static void saveMatrix(const vector<vector<double>>& dp,
-                           const string& seq1,
-                           const string& seq2)
-    {
-        ofstream file("matrix.csv");
-
-        file << "-";
-        for (char c : seq2) file << "," << c;
-        file << "\n";
-
-        for (int i = 0; i <= seq1.length(); i++) {
-            if (i == 0) file << "-";
-            else file << seq1[i-1];
-
-            for (int j = 0; j <= seq2.length(); j++) {
-                file << "," << fixed << setprecision(2) << dp[i][j];
+private:
+    // Helper to generate a CIGAR string from aligned strings and soft clips
+    static string generateCigar(const string& align1, const string& align2, 
+                                int leftClip, int rightClip) {
+        string cigar = "";
+        if (leftClip > 0) cigar += to_string(leftClip) + "S";
+        
+        int count = 0;
+        char lastOp = ' ';
+        
+        for (size_t i = 0; i < align1.length(); ++i) {
+            char op;
+            if (align1[i] == '-') op = 'I';       // Insertion to reference
+            else if (align2[i] == '-') op = 'D'; // Deletion from reference
+            else op = 'M';                       // Match or Mismatch
+            
+            if (op == lastOp) {
+                count++;
+            } else {
+                if (count > 0) cigar += to_string(count) + lastOp;
+                lastOp = op;
+                count = 1;
             }
-            file << "\n";
         }
-        file.close();
+        if (count > 0) cigar += to_string(count) + lastOp;
+        if (rightClip > 0) cigar += to_string(rightClip) + "S";
+        
+        return cigar;
     }
 
-    static void savePath(const vector<pair<int,int>>& path) {
-        ofstream file("traceback_path.csv");
-        file << "row,col\n";
-        for (auto& p : path)
-            file << p.first << "," << p.second << "\n";
-        file.close();
-    }
+public:
+    static void saveSAM(const AlignmentResult& res,
+                        const string& refName,
+                        int refLength,
+                        const string& readName,
+                        const string& usedRead,
+                        const string& originalRead,
+                        bool isReverse)
+    {
+        ofstream file("alignment.sam");
 
-    static void saveAlignment(const AlignmentResult& res) {
-        ofstream file("alignment.txt");
-        file << res.align1 << "\n" << res.align2 << "\n";
-        file << fixed << setprecision(2) << res.score << "\n";
+        // 1. Write Header
+        file << "@HD\tVN:1.6\tSO:unsorted\n";
+        file << "@SQ\tSN:" << refName << "\tLN:" << refLength << "\n";
+
+        // Determine POS and soft-clips from the traceback path
+        // path stores coordinates. The last element is the start of alignment (since traceback goes backwards)
+        // first_i is 1-based index on reference, first_j is 1-based index on read.
+        int first_i = res.path.empty() ? 0 : res.path.back().first;
+        int first_j = res.path.empty() ? 0 : res.path.back().second;
+
+        // POS (1-based leftmost mapping position)
+        int pos = first_i; 
+
+        // Calculate soft clips
+        int leftClip = first_j - 1;
+        int rightClip = usedRead.length() - res.maxJ;
+
+        // Generate CIGAR string
+        string cigar = generateCigar(res.align1, res.align2, leftClip, rightClip);
+
+        // Required SAM Fields
+        string qname = readName;
+        int flag = isReverse ? 16 : 0;
+        string rname = refName;
+        int mapq = 255;          // 255 = mapping quality not available
+        string rnext = "*";      // No mate/next segment
+        int pnext = 0;           // No mate
+        int tlen = 0;            // No template length
+        
+        // SEQ is the sequence mapped to the forward strand of the reference.
+        // Since usedRead was aligned against the forward reference, it is already oriented properly.
+        string seq = usedRead;
+        string qual = "*";       // Quality unavailable
+
+        // Optional tags: AS is the alignment score.
+        string optTag = "AS:i:" + to_string(static_cast<int>(res.score));
+
+        // Write Alignment Line
+        file << qname << "\t"
+             << flag << "\t"
+             << rname << "\t"
+             << pos << "\t"
+             << mapq << "\t"
+             << cigar << "\t"
+             << rnext << "\t"
+             << pnext << "\t"
+             << tlen << "\t"
+             << seq << "\t"
+             << qual << "\t"
+             << optTag << "\n";
+
         file.close();
     }
 };
@@ -221,18 +270,15 @@ int main() {
     }
 
     // Save outputs
-    OutputManager::saveMatrix(best.dp, reference, usedRead);
-    OutputManager::savePath(best.path);
-    OutputManager::saveAlignment(best);
+    bool isReverse = (strand == "-");
+    OutputManager::saveSAM(best, "REF", reference.length(), "READ1", usedRead, read, isReverse);
 
     // Console output
     cout << "\nBest Alignment (Strand " << strand << "):\n";
     cout << best.align1 << endl;
     cout << best.align2 << endl;
     cout << "Score: " << best.score << endl;
-
-    // Visualization
-    system("python visualize_matrix.py");
+    cout << "SAM alignment exported to alignment.sam" << endl;
 
     return 0;
 }
