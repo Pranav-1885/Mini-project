@@ -5,7 +5,7 @@
 #include <fstream>
 #include <cstdlib>
 #include <cmath>
-#include "fuzzy_scoring.h"   // or gaussian/sigmoidal/t2
+#include "triangular.h"   // or gaussian/sigmoidal/t2
 
 using namespace std;
 
@@ -48,6 +48,7 @@ while (getline(file, h)) {
     getline(file, qual);
     reads.push_back({seq, qual});
 }
+
 
 return reads;
 
